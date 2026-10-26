@@ -28,18 +28,33 @@ const ACCESS_DURATION_MS = 5 * 24 * 60 * 60 * 1000;
    CORS AND REQUEST HANDLING
 ========================================= */
 
+const cors = require("cors");
+
+const allowedOrigins = [
+    "https://gibsondexter.github.io",
+    "http://localhost:3000",
+    "http://127.0.0.1:5500",
+    "http://localhost:5500"
+];
+
 app.use(cors({
-    origin: [
-        "https://gibsondexter.github.io"
-    ],
+    origin: function (origin, callback) {
+        // Allow requests without an Origin header, such as server-side requests.
+        if (!origin || allowedOrigins.includes(origin)) {
+            return callback(null, true);
+        }
+
+        return callback(
+            new Error("Origin not allowed by CORS: " + origin)
+        );
+    },
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: [
         "Content-Type",
         "Authorization"
-    ]
+    ],
+    optionsSuccessStatus: 204
 }));
-
-app.use(express.json());
 
 /* =========================================
    FIREBASE ADMIN INITIALIZATION
