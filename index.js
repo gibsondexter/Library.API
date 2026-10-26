@@ -8,36 +8,44 @@ const crypto = require("crypto");
 
 const app = express();
 
-app.use(cors({
-    origin: [
-        "https://gibsondexter.github.io"
-    ],
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"]
-}));
-
-app.use(express.json());
-
 const PORT = process.env.PORT || 10000;
 
-const PAYCHANGU_SECRET_KEY =
-    process.env.PAYCHANGU_SECRET_KEY;
+const PAYCHANGU_SECRET_KEY = process.env.PAYCHANGU_SECRET_KEY;
 
-const BASE_URL =
+const BASE_URL = (
     process.env.RENDER_BASE_URL ||
-    "https://payment-api-j375.onrender.com";
+    "https://library-api-el4r.onrender.com"
+).replace(/\/+$/, "");
 
 const WEBSITE_URL =
     "https://gibsondexter.github.io/nalikule-book-access-website";
 
 const PAYMENT_AMOUNT = 500;
 const PAYMENT_CURRENCY = "MWK";
+const ACCESS_DURATION_MS = 5 * 24 * 60 * 60 * 1000;
 
-let db;
+/* =========================================
+   CORS AND REQUEST HANDLING
+========================================= */
 
-/* ------------------------------------------
+app.use(cors({
+    origin: [
+        "https://gibsondexter.github.io"
+    ],
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: [
+        "Content-Type",
+        "Authorization"
+    ]
+}));
+
+app.use(express.json());
+
+/* =========================================
    FIREBASE ADMIN INITIALIZATION
------------------------------------------- */
+========================================= */
+
+let db = null;
 
 try {
     const serviceAccountText =
@@ -45,7 +53,7 @@ try {
 
     if (!serviceAccountText) {
         throw new Error(
-            "FIREBASE_SERVICE_ACCOUNT is missing in Render."
+            "FIREBASE_SERVICE_ACCOUNT is missing."
         );
     }
 
@@ -59,18 +67,18 @@ try {
 
     db = admin.firestore();
 
-    console.log("Firebase Admin initialized.");
+    console.log("Firebase Admin initialized successfully.");
 
 } catch (error) {
     console.error(
-        "Firebase initialization error:",
+        "Firebase initialization failed:",
         error.message
     );
 }
 
-/* ------------------------------------------
-   HEALTH CHECK
------------------------------------------- */
+/* =========================================
+   BASIC ENDPOINTS
+========================================= */
 
 app.get("/", (req, res) => {
     res.json({
@@ -88,9 +96,9 @@ app.get("/health", (req, res) => {
     });
 });
 
-/* ------------------------------------------
-   REQUIRE CONFIGURATION
------------------------------------------- */
+/* =========================================
+   CONFIGURATION CHECK
+========================================= */
 
 function requireConfiguration(res) {
     if (!db) {
@@ -114,18 +122,19 @@ function requireConfiguration(res) {
     return true;
 }
 
-/* ------------------------------------------
-   VERIFY FIREBASE LOGIN
------------------------------------------- */
+/* =========================================
+   FIREBASE AUTHENTICATION
+========================================= */
 
 async function authenticateStudent(req, res, next) {
     try {
-        const authorization = req.headers.authorization || "";
+        const authorization =
+            req.headers.authorization || "";
 
         if (!authorization.startsWith("Bearer ")) {
             return res.status(401).json({
                 success: false,
-                message: "Please log in to continue."
+                message: "Please sign in before continuing."
             });
         }
 
@@ -140,18 +149,128 @@ async function authenticateStudent(req, res, next) {
         next();
 
     } catch (error) {
-        console.error("Authentication error:", error.message);
+        console.error(
+            "Authentication failed:",
+            error.message
+        );
 
         return res.status(401).json({
             success: false,
-            message: "Your login session is invalid. Please log in again."
+            message: "Your login session is invalid. Please sign in again."
         });
     }
 }
 
-/* ------------------------------------------
+/* =========================================
+   PAYMENT REFERENCE VALIDATION
+========================================= */
+
+function validTxRef(value) {
+    return (
+        typeof value === "string" &&
+        /^DEXLIB-\d{13}-[a-f0-9]{8}$/i.test(value)
+    );
+}
+
+/* =========================================
+   VERIFY PAYMENT WITH PAYCHANGU
+========================================= */
+
+async function verifyWithPayChangu(txRef) {
+    const response = await axios.get(
+        "https://api.paychangu.com/verify-payment/" +
+        encodeURIComponent(txRef),
+        {
+            headers: {
+                Authorization:
+                    `Bearer ${PAYCHANGU_SECRET_KEY}`,
+                Accept: "application/json"
+            },
+            timeout: 30000
+        }
+    );
+
+    return response.data;
+}
+
+/* =========================================
+   CHECK VERIFIED TRANSACTION DETAILS
+========================================= */
+
+function inspectVerification(verification, txRef) {
+    const transaction = verification?.data || {};
+
+    const status =
+        String(transaction.status || "").toLowerCase();
+
+    const currency =
+        String(transaction.currency || "").toUpperCase();
+
+    const reference =
+        String(transaction.tx_ref || "");
+
+    const amount = Number(transaction.amount);
+
+    const paid =
+        verification?.status === "success" &&
+        status === "success" &&
+        reference === txRef &&
+        currency === PAYMENT_CURRENCY &&
+        Number.isFinite(amount) &&
+        amount >= PAYMENT_AMOUNT;
+
+    return {
+        paid,
+        transaction,
+        amount,
+        currency,
+        reference
+    };
+}
+
+/* =========================================
+   UPDATE VERIFIED PAYMENT
+========================================= */
+
+async function markPaymentAsPaid(paymentRef, inspection) {
+    const snapshot = await paymentRef.get();
+
+    if (!snapshot.exists) {
+        throw new Error("Payment record does not exist.");
+    }
+
+    const existingPayment = snapshot.data();
+
+    // Do not change a previously recorded payment time.
+    // This prevents repeated verification extending access.
+    if (
+        existingPayment.status === "PAID" &&
+        existingPayment.paidAt
+    ) {
+        return existingPayment;
+    }
+
+    const paidAt =
+        admin.firestore.FieldValue.serverTimestamp();
+
+    await paymentRef.update({
+        status: "PAID",
+        amountPaid: inspection.amount,
+        currency: inspection.currency,
+        verifiedTxRef: inspection.reference,
+        paidAt: paidAt,
+        approvedAt: paidAt,
+        verifiedAt: paidAt
+    });
+
+    const updatedSnapshot = await paymentRef.get();
+
+    return updatedSnapshot.data();
+}
+
+/* =========================================
    CREATE PAYCHANGU CHECKOUT
------------------------------------------- */
+========================================= */
 
 app.post(
     "/api/create-checkout",
@@ -160,19 +279,16 @@ app.post(
 
         if (!requireConfiguration(res)) return;
 
+        let paymentRef = null;
+
         try {
             const uid = req.studentUid;
 
-            /*
-             * Never trust the student's submitted name,
-             * email, registration number, or amount.
-             * Retrieve the profile from Firestore.
-             */
-
-            const studentRef =
-                db.collection("students").doc(uid);
-
-            const studentSnapshot = await studentRef.get();
+            // Read the student's trusted profile.
+            const studentSnapshot = await db
+                .collection("students")
+                .doc(uid)
+                .get();
 
             if (!studentSnapshot.exists) {
                 return res.status(404).json({
@@ -193,35 +309,35 @@ app.post(
                 String(student.regNumber || "").trim();
 
             const email =
-                String(req.authEmail || student.email || "").trim();
+                String(
+                    req.authEmail ||
+                    student.email ||
+                    ""
+                ).trim();
 
             if (!firstName || !lastName || !regNumber || !email) {
                 return res.status(400).json({
                     success: false,
                     message:
-                        "Your name, registration number, or email is missing. Please contact the administrator."
+                        "Your student name, registration number or email is missing."
                 });
             }
 
-            /*
-             * Unique reference for this payment.
-             */
-
+            // Generate a unique transaction reference.
             const txRef =
                 "DEXLIB-" +
                 Date.now() +
                 "-" +
                 crypto.randomBytes(4).toString("hex");
 
-            /*
-             * Create a pending Firestore payment record.
-             */
+            paymentRef = db
+                .collection("payments")
+                .doc(txRef);
 
-            const paymentRef =
-                db.collection("payments").doc(txRef);
-
+            // Save a pending payment before contacting PayChangu.
             await paymentRef.set({
                 uid: uid,
+                studentId: uid,
                 name: `${firstName} ${lastName}`,
                 firstName: firstName,
                 lastName: lastName,
@@ -232,19 +348,12 @@ app.post(
                 amount: PAYMENT_AMOUNT,
                 currency: PAYMENT_CURRENCY,
                 status: "PENDING",
+                provider: "PayChangu",
                 createdAt:
-                    admin.firestore.FieldValue.serverTimestamp(),
-                provider: "PayChangu"
+                    admin.firestore.FieldValue.serverTimestamp()
             });
 
-            /*
-             * Create a fresh PayChangu checkout session.
-             *
-             * The API accepts first_name, last_name,
-             * email, amount, currency and tx_ref.
-             */
-
-            const paymentResponse = await axios.post(
+            const response = await axios.post(
                 "https://api.paychangu.com/payment",
                 {
                     amount: String(PAYMENT_AMOUNT),
@@ -263,7 +372,7 @@ app.post(
                     customization: {
                         title: "DEXTER-LIBRARY Access",
                         description:
-                            "Library access registration fee"
+                            "Library access fee"
                     },
 
                     meta: {
@@ -283,25 +392,25 @@ app.post(
                 }
             );
 
-            const responseData = paymentResponse.data;
+            const responseData = response.data;
 
             const checkoutUrl =
-                responseData &&
-                responseData.data &&
-                responseData.data.checkout_url;
+                responseData?.data?.checkout_url;
 
             if (
-                responseData.status !== "success" ||
-                !checkoutUrl
+                responseData?.status !== "success" ||
+                typeof checkoutUrl !== "string" ||
+                !checkoutUrl.startsWith("https://")
             ) {
+                console.error(
+                    "Unexpected PayChangu checkout response:",
+                    JSON.stringify(responseData)
+                );
+
                 throw new Error(
-                    "PayChangu did not return a checkout URL."
+                    "PayChangu did not return a valid checkout URL."
                 );
             }
-
-            /*
-             * Save the reference and checkout details.
-             */
 
             await paymentRef.update({
                 checkoutUrl: checkoutUrl,
@@ -323,6 +432,21 @@ app.post(
                 error.response?.data || error.message
             );
 
+            if (paymentRef) {
+                try {
+                    await paymentRef.update({
+                        checkoutError: String(error.message || "Checkout failed"),
+                        checkoutFailedAt:
+                            admin.firestore.FieldValue.serverTimestamp()
+                    });
+                } catch (updateError) {
+                    console.error(
+                        "Could not record checkout error:",
+                        updateError.message
+                    );
+                }
+            }
+
             return res.status(500).json({
                 success: false,
                 message:
@@ -333,30 +457,9 @@ app.post(
     }
 );
 
-/* ------------------------------------------
-   VERIFY PAYMENT DIRECTLY WITH PAYCHANGU
------------------------------------------- */
-
-async function verifyWithPayChangu(txRef) {
-    const response = await axios.get(
-        "https://api.paychangu.com/verify-payment/" +
-        encodeURIComponent(txRef),
-        {
-            headers: {
-                Authorization:
-                    `Bearer ${PAYCHANGU_SECRET_KEY}`,
-                Accept: "application/json"
-            },
-            timeout: 30000
-        }
-    );
-
-    return response.data;
-}
-
-/* ------------------------------------------
-   CHECK A PAYMENT STATUS
------------------------------------------- */
+/* =========================================
+   VERIFY A PAYMENT
+========================================= */
 
 app.get(
     "/api/verify/:txRef",
@@ -367,6 +470,13 @@ app.get(
 
         try {
             const txRef = String(req.params.txRef || "");
+
+            if (!validTxRef(txRef)) {
+                return res.status(400).json({
+                    success: false,
+                    message: "Invalid payment reference."
+                });
+            }
 
             const paymentRef =
                 db.collection("payments").doc(txRef);
@@ -382,10 +492,7 @@ app.get(
 
             const payment = paymentSnapshot.data();
 
-            /*
-             * Students can only check their own payment.
-             */
-
+            // Only the owner can verify this payment.
             if (payment.uid !== req.studentUid) {
                 return res.status(403).json({
                     success: false,
@@ -393,105 +500,84 @@ app.get(
                 });
             }
 
-            /*
-             * Reuse verified PAID status.
-             */
+            // Verify with PayChangu even when a previous status is PAID.
+            // This endpoint must not grant access based on a URL alone.
+            const verification = await verifyWithPayChangu(txRef);
 
-            if (payment.status === "PAID") {
+            const inspection =
+                inspectVerification(verification, txRef);
+
+            if (!inspection.paid) {
                 return res.json({
                     success: true,
-                    paid: true,
-                    status: "PAID",
-                    amount: payment.amount,
-                    regNumber: payment.regNumber
+                    paid: false,
+                    status: payment.status || "PENDING",
+                    message:
+                        "PayChangu has not confirmed a successful payment."
                 });
             }
 
-            /*
-             * Ask PayChangu for the real transaction status.
-             */
+            const updatedPayment = await markPaymentAsPaid(
+                paymentRef,
+                inspection
+            );
 
-            const verification =
-                await verifyWithPayChangu(txRef);
+            const paidAt = updatedPayment.paidAt;
 
-            const transaction = verification.data || {};
+            const paidAtMs =
+                paidAt && typeof paidAt.toMillis === "function"
+                    ? paidAt.toMillis()
+                    : 0;
 
-            const verifiedStatus =
-                String(transaction.status || "").toLowerCase();
+            const accessExpiresAt =
+                paidAtMs
+                    ? paidAtMs + ACCESS_DURATION_MS
+                    : null;
 
-            const verifiedAmount =
-                Number(transaction.amount);
-
-            const verifiedCurrency =
-                String(transaction.currency || "").toUpperCase();
-
-            const verifiedReference =
-                String(transaction.tx_ref || "");
-
-            const paymentSucceeded =
-                verification.status === "success" &&
-                verifiedStatus === "success" &&
-                verifiedReference === txRef &&
-                verifiedCurrency === PAYMENT_CURRENCY &&
-                verifiedAmount >= PAYMENT_AMOUNT;
-
-            if (paymentSucceeded) {
-
-                await paymentRef.update({
-                    status: "PAID",
-                    amountPaid: verifiedAmount,
-                    currency: verifiedCurrency,
-                    verifiedTxRef: verifiedReference,
-                    approvedAt:
-                        admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                return res.json({
-                    success: true,
-                    paid: true,
-                    status: "PAID",
-                    amount: verifiedAmount,
-                    regNumber: payment.regNumber
-                });
-            }
+            const accessActive =
+                Boolean(accessExpiresAt) &&
+                Date.now() < accessExpiresAt;
 
             return res.json({
                 success: true,
-                paid: false,
-                status: payment.status || "PENDING",
-                message:
-                    "PayChangu has not confirmed a successful payment."
+                paid: true,
+                status: "PAID",
+                amount: inspection.amount,
+                currency: inspection.currency,
+                tx_ref: txRef,
+                regNumber: payment.regNumber,
+                accessActive: accessActive,
+                accessExpiresAt: accessExpiresAt
             });
 
         } catch (error) {
             console.error(
-                "Payment verification error:",
+                "Payment verification failed:",
                 error.response?.data || error.message
             );
 
             return res.status(500).json({
                 success: false,
                 message:
-                    "Unable to verify the payment at this time."
+                    "Unable to verify the payment. Please try again."
             });
         }
     }
 );
 
-/* ------------------------------------------
+/* =========================================
    PAYCHANGU CALLBACK
------------------------------------------- */
+========================================= */
 
 app.get("/paychangu/callback", async (req, res) => {
-
     if (!requireConfiguration(res)) return;
 
     try {
         const txRef = String(req.query.tx_ref || "");
 
-        if (!txRef) {
+        if (!validTxRef(txRef)) {
             return res.redirect(
-                `${WEBSITE_URL}/payment-result.html?status=missing_reference`
+                `${WEBSITE_URL}/payment-result.html?status=invalid_reference`
             );
         }
 
@@ -506,55 +592,40 @@ app.get("/paychangu/callback", async (req, res) => {
             );
         }
 
-        /*
-         * Always verify server-side. Do not trust
-         * the status in the redirect URL.
-         */
+        const payment = paymentSnapshot.data();
 
-        const verification =
-            await verifyWithPayChangu(txRef);
-
-        const transaction = verification.data || {};
-
-        const verifiedStatus =
-            String(transaction.status || "").toLowerCase();
-
-        const verifiedAmount =
-            Number(transaction.amount);
-
-        const verifiedCurrency =
-            String(transaction.currency || "").toUpperCase();
-
-        const verifiedReference =
-            String(transaction.tx_ref || "");
-
-        const isPaid =
-            verification.status === "success" &&
-            verifiedStatus === "success" &&
-            verifiedReference === txRef &&
-            verifiedCurrency === PAYMENT_CURRENCY &&
-            verifiedAmount >= PAYMENT_AMOUNT;
-
-        if (isPaid) {
-            await paymentRef.update({
-                status: "PAID",
-                amountPaid: verifiedAmount,
-                currency: verifiedCurrency,
-                verifiedTxRef: verifiedReference,
-                approvedAt:
-                    admin.firestore.FieldValue.serverTimestamp()
-            });
+        // Verify ownership using the saved payment metadata.
+        if (!payment.uid) {
+            return res.redirect(
+                `${WEBSITE_URL}/payment-result.html?status=invalid_payment`
+            );
         }
+
+        // Always ask PayChangu for the transaction result.
+        const verification = await verifyWithPayChangu(txRef);
+
+        const inspection =
+            inspectVerification(verification, txRef);
+
+        if (!inspection.paid) {
+            return res.redirect(
+                `${WEBSITE_URL}/payment-result.html` +
+                `?tx_ref=${encodeURIComponent(txRef)}` +
+                `&status=pending`
+            );
+        }
+
+        await markPaymentAsPaid(paymentRef, inspection);
 
         return res.redirect(
             `${WEBSITE_URL}/payment-result.html` +
             `?tx_ref=${encodeURIComponent(txRef)}` +
-            `&status=${isPaid ? "success" : "pending"}`
+            `&status=success`
         );
 
     } catch (error) {
         console.error(
-            "PayChangu callback error:",
+            "PayChangu callback failed:",
             error.response?.data || error.message
         );
 
@@ -564,12 +635,15 @@ app.get("/paychangu/callback", async (req, res) => {
     }
 });
 
-/* ------------------------------------------
+/* =========================================
    START SERVER
------------------------------------------- */
+========================================= */
 
 app.listen(PORT, () => {
     console.log(
         `DEXTER-LIBRARY Payment API running on port ${PORT}`
     );
+
+    console.log("Website:", WEBSITE_URL);
+    console.log("Payment amount:", PAYMENT_AMOUNT, PAYMENT_CURRENCY);
 });
