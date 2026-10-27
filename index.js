@@ -1,18 +1,6 @@
 "use strict";
 
-/* =====================================================
-   DEXTER-LIBRARY PAYMENT API
-   Express + Firebase Admin + PayChangu
 
-   Payment: MK500
-   Access: 5 days
-
-   Successful payment flow:
-   PayChangu
-       -> Render callback
-       -> Verify with PayChangu
-       -> Update Firebase
-       -> Redirect to materials.html
 ===================================================== */
 
 const express = require("express");
